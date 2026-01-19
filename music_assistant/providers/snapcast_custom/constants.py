@@ -42,6 +42,7 @@ CONTROL_SOCKET_PATH_TEMPLATE = "/tmp/ma-snapcast-custom-{queue_id}.sock"  # noqa
 
 MASS_STREAM_PREFIX = "Music Assistant Custom - "
 MASS_ANNOUNCEMENT_POSTFIX = " (announcement)"
+MASS_META_POSTFIX = " (meta)"
 SNAPWEB_DIR = pathlib.Path(__file__).parent.resolve().joinpath("snapweb")
 CONTROL_SCRIPT = pathlib.Path(__file__).parent.resolve().joinpath("control.py")
 
@@ -68,3 +69,4 @@ class SnapCastStreamType(StrEnum):
 
     MUSIC = "MUSIC"
     ANNOUNCEMENT = "ANNOUNCEMENT"
+    META = "META"

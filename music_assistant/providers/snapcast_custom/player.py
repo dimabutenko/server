@@ -27,6 +27,7 @@ from music_assistant.providers.snapcast_custom.constants import (
     CONF_ENTRY_SAMPLE_RATES_SNAPCAST,
     DEFAULT_SNAPCAST_FORMAT,
     MASS_ANNOUNCEMENT_POSTFIX,
+    MASS_META_POSTFIX,
     MASS_STREAM_PREFIX,
     SnapCastStreamType,
 )
@@ -105,8 +106,10 @@ class SnapCastPlayer(Player):
             assert snapgroup is not None  # for type checking
             await snapgroup.set_stream("default")
 
-        # but we always delete the music stream (whether it was active or not)
+        # but we always delete the music, announcement and meta stream
         await self._delete_stream(self._get_stream_name(SnapCastStreamType.MUSIC))
+        await self._delete_stream(self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT))
+        await self._delete_stream(self._get_stream_name(SnapCastStreamType.META))
 
         if self._stream_task is not None:
             if not self._stream_task.done():
@@ -165,16 +168,26 @@ class SnapCastPlayer(Player):
                     await self._stream_task
             self._stream_task = None
 
-        # get stream or create new one
-        stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
-        stream = await self._get_or_create_stream(stream_name, media.source_id or self.player_id)
+        # get music stream or create new one
+        music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
+        music_stream = await self._get_or_create_stream(
+            music_stream_name, media.source_id or self.player_id, codec="null"
+        )
+
+        # get announcement stream or create new one (needed for meta stream even if not playing now)
+        announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
+        await self._get_or_create_stream(announcement_stream_name, None, codec="null")
+
+        # get meta stream or create new one
+        meta_stream_name = self._get_stream_name(SnapCastStreamType.META)
+        meta_stream = await self._get_or_create_stream(meta_stream_name, None, is_meta=True)
 
         # if no announcement is playing we activate the stream now, otherwise it
         # will be activated by play_announcement when the announcement is over.
         if not self.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
             snap_group = self._get_snapgroup()
             assert snap_group is not None  # for type checking
-            await snap_group.set_stream(stream.identifier)
+            await snap_group.set_stream(meta_stream.identifier)
 
         self._attr_current_media = media
 
@@ -182,7 +195,7 @@ class SnapCastPlayer(Player):
         audio_source = self.mass.streams.get_stream(media, DEFAULT_SNAPCAST_FORMAT)
 
         async def _streamer() -> None:
-            stream_path = self._get_stream_path(stream)
+            stream_path = self._get_stream_path(music_stream)
             self.logger.debug("Start streaming to %s", stream_path)
             async with FFMpeg(
                 audio_input=audio_source,
@@ -206,7 +219,7 @@ class SnapCastPlayer(Player):
             self.logger.debug("Finished streaming to %s", stream_path)
             # we need to wait a bit for the stream status to become idle
             # to ensure that all snapclients have consumed the audio
-            while stream.status != "idle":
+            while music_stream.status != "idle":
                 await asyncio.sleep(0.25)
             self._attr_playback_state = PlaybackState.IDLE
             self._attr_elapsed_time = time.time() - self._attr_elapsed_time_last_updated
@@ -220,14 +233,24 @@ class SnapCastPlayer(Player):
         self, announcement: PlayerMedia, volume_level: int | None = None
     ) -> None:
         """Handle (provider native) playback of an announcement on given player."""
-        # get stream or create new one
-        stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
-        stream = await self._get_or_create_stream(stream_name, None)
+        # get music stream or create new one (if not exists)
+        music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
+        await self._get_or_create_stream(music_stream_name, self.player_id, codec="null")
 
-        # always activate the stream (announcements have priority over music)
+        # get announcement stream or create new one
+        announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
+        announcement_stream = await self._get_or_create_stream(
+            announcement_stream_name, None, codec="null"
+        )
+
+        # get meta stream or create new one
+        meta_stream_name = self._get_stream_name(SnapCastStreamType.META)
+        meta_stream = await self._get_or_create_stream(meta_stream_name, None, is_meta=True)
+
+        # always activate the meta stream (it handles priorities)
         snap_group = self._get_snapgroup()
         assert snap_group is not None  # for type checking
-        await snap_group.set_stream(stream.identifier)
+        await snap_group.set_stream(meta_stream.identifier)
 
         # Unfortunately snapcast sets a volume per client (not per stream), so we need a way to
         # set the announcement volume without affecting the music volume.
@@ -249,7 +272,7 @@ class SnapCastPlayer(Player):
 
         # stream the audio, wait for it to finish (play_announcement should return after the
         # announcement is over to avoid simultaneous announcements).
-        stream_path = self._get_stream_path(stream)
+        stream_path = self._get_stream_path(announcement_stream)
         self.logger.debug("Start announcement streaming to %s", stream_path)
         async with FFMpeg(
             audio_input=audio_source,
@@ -266,25 +289,20 @@ class SnapCastPlayer(Player):
         self.logger.debug("Finished announcement streaming to %s", stream_path)
         # we need to wait a bit for the stream status to become idle
         # to ensure that all snapclients have consumed the audio
-        while stream.status != "idle":
+        while announcement_stream.status != "idle":
             await asyncio.sleep(0.25)
 
         # delete the announcement stream
-        await self._delete_stream(stream_name)
+        await self._delete_stream(announcement_stream_name)
 
         # restore volume, if we changed it above and it's still the same we set
         # (the user did not change it himself while the announcement was playing)
         if self.volume_level == volume_level and orig_volume_level is not None:
             await self.volume_set(orig_volume_level)
 
-        # and restore the group to either the default or the music stream
-        if self.playback_state == PlaybackState.IDLE:
-            new_stream_name = "default"
-        else:
-            new_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
-        group = self._get_snapgroup()
-        assert group is not None  # for type checking
-        await group.set_stream(new_stream_name)
+        # we don't need to manually switch back to music stream,
+        # because we are using meta stream which will automatically
+        # switch back to music (the next priority) when announcement stream is gone.
 
     async def get_config_entries(
         self,
@@ -340,9 +358,17 @@ class SnapCastPlayer(Player):
         stream_name = f"{MASS_STREAM_PREFIX}{safe_name}"
         if stream_type == SnapCastStreamType.ANNOUNCEMENT:
             stream_name += MASS_ANNOUNCEMENT_POSTFIX
+        elif stream_type == SnapCastStreamType.META:
+            stream_name += MASS_META_POSTFIX
         return stream_name
 
-    async def _get_or_create_stream(self, stream_name: str, queue_id: str | None) -> Snapstream:
+    async def _get_or_create_stream(
+        self,
+        stream_name: str,
+        queue_id: str | None,
+        codec: str | None = None,
+        is_meta: bool = False,
+    ) -> Snapstream:
         """Create new stream on snapcast server (or return existing one)."""
         # prefer to reuse existing stream if possible
         if stream := self._get_snapstream(stream_name):
@@ -365,21 +391,37 @@ class SnapCastPlayer(Player):
                 f"--streamserver-port={self.mass.streams.publish_port}"
             )
 
-        attempts = 50
-        while attempts:
-            attempts -= 1
+        if codec:
+            extra_args += f"&codec={codec}"
+
+        if is_meta:
+            announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
+            music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
+            uri = f"meta:///{announcement_stream_name}/{music_stream_name}?name={stream_name}"
+        else:
             # pick a random port
             port = random.randint(4953, 4953 + 200)
-            result = await self.provider._snapserver.stream_add_stream(
-                # NOTE: setting the sampleformat to something else
-                # (like 24 bits bit depth) does not seem to work at all!
+            uri = (
                 f"tcp://0.0.0.0:{port}?sampleformat=48000:16:2"
                 f"&idle_threshold={self.provider._snapcast_stream_idle_threshold}"
                 f"{extra_args}&name={stream_name}"
             )
+
+        attempts = 50
+        while attempts:
+            attempts -= 1
+            result = await self.provider._snapserver.stream_add_stream(uri)
             if "id" not in result:
                 # if the port is already taken, the result will be an error
                 self.logger.warning(result)
+                if not is_meta:
+                    # pick a new random port
+                    port = random.randint(4953, 4953 + 200)
+                    uri = (
+                        f"tcp://0.0.0.0:{port}?sampleformat=48000:16:2"
+                        f"&idle_threshold={self.provider._snapcast_stream_idle_threshold}"
+                        f"{extra_args}&name={stream_name}"
+                    )
                 continue
             return self.provider._snapserver.stream(result["id"])
         msg = "Unable to create stream - No free port found?"
