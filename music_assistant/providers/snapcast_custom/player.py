@@ -1,4 +1,4 @@
-"""Snapcast Player."""
+"""Snapcast Player (Meta-Stream Edition)."""
 
 import asyncio
 import random
@@ -14,30 +14,23 @@ from snapcast.control.client import Snapclient
 from snapcast.control.group import Snapgroup
 from snapcast.control.stream import Snapstream
 
-from music_assistant.constants import (
-    ATTR_ANNOUNCEMENT_IN_PROGRESS,
-    CONF_ENTRY_FLOW_MODE_ENFORCED,
-    CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
-)
 from music_assistant.helpers.audio import get_player_filter_params
 from music_assistant.helpers.compare import create_safe_string
 from music_assistant.helpers.ffmpeg import FFMpeg
 from music_assistant.models.player import Player
-from music_assistant.providers.snapcast_custom.constants import (
-    CONF_ENTRY_SAMPLE_RATES_SNAPCAST,
+from music_assistant.providers.snapcast.constants import (
     DEFAULT_SNAPCAST_FORMAT,
     MASS_ANNOUNCEMENT_POSTFIX,
-    MASS_META_POSTFIX,
     MASS_STREAM_PREFIX,
     SnapCastStreamType,
 )
 
 if TYPE_CHECKING:
-    from music_assistant.providers.snapcast_custom.provider import SnapCastProvider
+    from .provider import SnapCastProvider
 
 
 class SnapCastPlayer(Player):
-    """SnapCastPlayer."""
+    """SnapCastPlayer with Meta-Stream support."""
 
     def __init__(
         self,
@@ -55,15 +48,9 @@ class SnapCastPlayer(Player):
 
     @property
     def synced_to(self) -> str | None:
-        """
-        Return the id of the player this player is synced to (sync leader).
-
-        If this player is not synced to another player (or is the sync leader itself),
-        this should return None.
-        If it is part of a (permanent) group, this should also return None.
-        """
+        """Return the id of the player this player is synced to."""
         snap_group = self._get_snapgroup()
-        assert snap_group is not None  # for type checking
+        assert snap_group is not None
         master_id: str = self.provider._get_ma_id(snap_group.clients[0])
         if len(snap_group.clients) < 2 or self.player_id == master_id:
             return None
@@ -92,24 +79,10 @@ class SnapCastPlayer(Player):
 
     async def stop(self) -> None:
         """Send STOP command to given player."""
-        # update the state first to avoid race conditions, if an active play_announcement
-        # finishes the player.state should be IDLE.
         self._attr_playback_state = PlaybackState.IDLE
         self._attr_current_media = None
         self._set_childs_state()
-
         self.update_state()
-
-        # we change the active stream only if music was playing
-        if not self.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
-            snapgroup = self._get_snapgroup()
-            assert snapgroup is not None  # for type checking
-            await snapgroup.set_stream("default")
-
-        # but we always delete the music, announcement and meta stream
-        await self._delete_stream(self._get_stream_name(SnapCastStreamType.MUSIC))
-        await self._delete_stream(self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT))
-        await self._delete_stream(self._get_stream_name(SnapCastStreamType.META))
 
         if self._stream_task is not None:
             if not self._stream_task.done():
@@ -119,8 +92,7 @@ class SnapCastPlayer(Player):
             self._stream_task = None
 
     async def volume_mute(self, muted: bool) -> None:
-        """Send MUTE command to given player."""
-        # Using optimistic value because the library does not return the response from the api
+        """Send MUTE command."""
         await self.snap_client.set_muted(muted)
         self._attr_volume_muted = muted
         self.update_state()
@@ -132,22 +104,22 @@ class SnapCastPlayer(Player):
     ) -> None:
         """Handle SET_MEMBERS command on the player."""
         group = self._get_snapgroup()
-        assert group is not None  # for type checking
-        # handle client additions
+        assert group is not None
+
         for player_id in player_ids_to_add or []:
             snapcast_id = self.provider._get_snapclient_id(player_id)
             if snapcast_id not in group.clients:
                 await group.add_client(snapcast_id)
                 if player_id not in self._attr_group_members:
                     self._attr_group_members.append(player_id)
-        # handle client removals
+
         for player_id in player_ids_to_remove or []:
             snapcast_id = self.provider._get_snapclient_id(player_id)
             if snapcast_id in group.clients:
                 await group.remove_client(snapcast_id)
                 if player_id in self._attr_group_members:
                     self._attr_group_members.remove(player_id)
-                # Set default stream and stop ungrouped players
+
                 removed_snapclient = self.provider._snapserver.client(snapcast_id)
                 await removed_snapclient.group.set_stream("default")
                 if removed_player := self.mass.players.get(player_id):
@@ -157,10 +129,9 @@ class SnapCastPlayer(Player):
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
         if self.synced_to:
-            msg = "A synced player cannot receive play commands directly"
-            raise RuntimeError(msg)
+            raise RuntimeError("A synced player cannot receive play commands directly")
 
-        # stop any existing streamtasks first
+        # Stop existing task
         if self._stream_task is not None:
             if not self._stream_task.done():
                 self._stream_task.cancel()
@@ -168,35 +139,15 @@ class SnapCastPlayer(Player):
                     await self._stream_task
             self._stream_task = None
 
-        # get music stream or create new one
-        music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
-        music_stream = await self._get_or_create_stream(
-            music_stream_name, media.source_id or self.player_id, codec="null"
-        )
-
-        # get announcement stream or create new one (needed for meta stream even if not playing now)
-        announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
-        await self._get_or_create_stream(announcement_stream_name, None, codec="null")
-
-        # get meta stream or create new one
-        meta_stream_name = self._get_stream_name(SnapCastStreamType.META)
-        meta_stream = await self._get_or_create_stream(meta_stream_name, None, is_meta=True)
-
-        # if no announcement is playing we activate the stream now, otherwise it
-        # will be activated by play_announcement when the announcement is over.
-        if not self.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
-            snap_group = self._get_snapgroup()
-            assert snap_group is not None  # for type checking
-            await snap_group.set_stream(meta_stream.identifier)
+        music_stream = await self._ensure_meta_pipeline(media.source_id or self.player_id)
 
         self._attr_current_media = media
-
-        # select audio source
         audio_source = self.mass.streams.get_stream(media, DEFAULT_SNAPCAST_FORMAT)
 
         async def _streamer() -> None:
             stream_path = self._get_stream_path(music_stream)
-            self.logger.debug("Start streaming to %s", stream_path)
+            self.logger.debug("Start streaming music to %s", stream_path)
+
             async with FFMpeg(
                 audio_input=audio_source,
                 input_format=DEFAULT_SNAPCAST_FORMAT,
@@ -212,57 +163,37 @@ class SnapCastPlayer(Player):
                 self._attr_elapsed_time = 0
                 self._attr_elapsed_time_last_updated = time.time()
                 self.update_state()
-
                 self._set_childs_state()
+
                 await ffmpeg_proc.wait()
 
-            self.logger.debug("Finished streaming to %s", stream_path)
-            # we need to wait a bit for the stream status to become idle
-            # to ensure that all snapclients have consumed the audio
+            self.logger.debug("Finished streaming music")
             while music_stream.status != "idle":
                 await asyncio.sleep(0.25)
+
             self._attr_playback_state = PlaybackState.IDLE
-            self._attr_elapsed_time = time.time() - self._attr_elapsed_time_last_updated
             self.update_state()
             self._set_childs_state()
 
-        # start streaming the queue (pcm) audio in a background task
         self._stream_task = self.mass.create_task(_streamer())
 
     async def play_announcement(
         self, announcement: PlayerMedia, volume_level: int | None = None
     ) -> None:
-        """Handle (provider native) playback of an announcement on given player."""
-        # get music stream or create new one (if not exists)
-        music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
-        await self._get_or_create_stream(music_stream_name, self.player_id, codec="null")
+        """Handle playback of an announcement."""
+        await self._ensure_meta_pipeline(None)
 
-        # get announcement stream or create new one
-        announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
-        announcement_stream = await self._get_or_create_stream(
-            announcement_stream_name, None, codec="null"
-        )
+        stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
+        announce_stream = self._get_snapstream(stream_name)
+        assert announce_stream is not None
 
-        # get meta stream or create new one
-        meta_stream_name = self._get_stream_name(SnapCastStreamType.META)
-        meta_stream = await self._get_or_create_stream(meta_stream_name, None, is_meta=True)
-
-        # always activate the meta stream (it handles priorities)
-        snap_group = self._get_snapgroup()
-        assert snap_group is not None  # for type checking
-        await snap_group.set_stream(meta_stream.identifier)
-
-        # Unfortunately snapcast sets a volume per client (not per stream), so we need a way to
-        # set the announcement volume without affecting the music volume.
-        # We go for the simplest solution: save the previous volume, change it, restore later
-        # (with the downside that the change will be visible in the UI)
-        orig_volume_level = self.volume_level  # Note: might be None
-
+        orig_volume_level = self.volume_level
         if volume_level is not None:
             await self.volume_set(volume_level)
 
         input_format = DEFAULT_SNAPCAST_FORMAT
-        assert announcement.custom_data is not None  # for type checking
+        assert announcement.custom_data is not None
+
         audio_source = self.mass.streams.get_announcement_stream(
             announcement.custom_data["announcement_url"],
             output_format=DEFAULT_SNAPCAST_FORMAT,
@@ -270,10 +201,9 @@ class SnapCastPlayer(Player):
             pre_announce_url=announcement.custom_data["pre_announce_url"],
         )
 
-        # stream the audio, wait for it to finish (play_announcement should return after the
-        # announcement is over to avoid simultaneous announcements).
-        stream_path = self._get_stream_path(announcement_stream)
+        stream_path = self._get_stream_path(announce_stream)
         self.logger.debug("Start announcement streaming to %s", stream_path)
+
         async with FFMpeg(
             audio_input=audio_source,
             input_format=input_format,
@@ -286,102 +216,77 @@ class SnapCastPlayer(Player):
         ) as ffmpeg_proc:
             await ffmpeg_proc.wait()
 
-        self.logger.debug("Finished announcement streaming to %s", stream_path)
-        # we need to wait a bit for the stream status to become idle
-        # to ensure that all snapclients have consumed the audio
-        while announcement_stream.status != "idle":
+        self.logger.debug("Finished announcement")
+
+        while announce_stream.status != "idle":
             await asyncio.sleep(0.25)
 
-        # delete the announcement stream
-        await self._delete_stream(announcement_stream_name)
-
-        # restore volume, if we changed it above and it's still the same we set
-        # (the user did not change it himself while the announcement was playing)
         if self.volume_level == volume_level and orig_volume_level is not None:
             await self.volume_set(orig_volume_level)
 
-        # we don't need to manually switch back to music stream,
-        # because we are using meta stream which will automatically
-        # switch back to music (the next priority) when announcement stream is gone.
+    async def _ensure_meta_pipeline(self, music_queue_id: str | None) -> Snapstream:
+        music_name = self._get_stream_name(SnapCastStreamType.MUSIC)
+        announce_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
+
+        meta_name = f"{MASS_STREAM_PREFIX}{create_safe_string(self.player_id)}_meta"
+
+        music_stream = await self._get_or_create_stream(music_name, music_queue_id)
+
+        await self._get_or_create_stream(announce_name, None)
+
+        if not self._get_snapstream(meta_name):
+            self.logger.debug("Creating META stream: %s", meta_name)
+
+            uri = f"meta:///{announce_name}/{music_name}?name={meta_name}"
+            await self.provider._snapserver.stream_add_stream(uri)
+
+            await asyncio.sleep(0.2)
+
+        group = self._get_snapgroup()
+        assert group is not None
+
+        meta_stream_obj = self._get_snapstream(meta_name)
+
+        if meta_stream_obj and group.stream != meta_stream_obj.identifier:
+            self.logger.info("Switching group to META stream: %s", meta_name)
+            await group.set_stream(meta_stream_obj.identifier)
+
+        return music_stream
 
     async def get_config_entries(
         self,
         action: str | None = None,
         values: dict[str, ConfigValueType] | None = None,
     ) -> list[ConfigEntry]:
-        """Player config."""
-        base_entries = await super().get_config_entries(action=action, values=values)
-        return [
-            *base_entries,
-            CONF_ENTRY_FLOW_MODE_ENFORCED,
-            CONF_ENTRY_SAMPLE_RATES_SNAPCAST,
-            CONF_ENTRY_OUTPUT_CODEC_HIDDEN,
-        ]
+        """Return config entries for this player."""
+        return await super().get_config_entries(action, values)
 
     def _handle_player_update(self, snap_client: Snapclient) -> None:
-        """Process Snapcast update to Player controller.
-
-        This is a callback function
-        """
         self._attr_name = self.snap_client.friendly_name
         self._attr_volume_level = self.snap_client.volume
         self._attr_volume_muted = self.snap_client.muted
         self._attr_available = self.snap_client.connected
 
-        # Note: when the active stream is a MASS stream the active_source is __not__ updated at all.
-        # So it doesn't matter whether a MASS stream is for music or announcements.
-        if stream := self._get_active_snapstream():
-            if stream.identifier == "default":
-                self._attr_active_source = None
-            elif not stream.identifier.startswith(MASS_STREAM_PREFIX):
-                # unknown source
-                self._attr_active_source = stream.identifier
-        else:
-            self._attr_active_source = None
-
         self._group_childs()
-
         self.update_state()
 
     def _get_stream_name(self, stream_type: SnapCastStreamType) -> str:
-        """Return the name of the stream for the given player.
-
-        Each player can have up to two concurrent streams, for music and announcements.
-
-        The stream name depends only on player_id (not queue_id) for two reasones:
-        1. Avoid issues when the same queue_id is simultaneously used by two players
-           (eg in universal groups).
-        2. Easily identify which stream belongs to which player, for instance to be able to
-           delete a music stream even when it is not active due to an announcement.
-        """
         safe_name = create_safe_string(self.player_id, replace_space=True)
         stream_name = f"{MASS_STREAM_PREFIX}{safe_name}"
         if stream_type == SnapCastStreamType.ANNOUNCEMENT:
             stream_name += MASS_ANNOUNCEMENT_POSTFIX
-        elif stream_type == SnapCastStreamType.META:
-            stream_name += MASS_META_POSTFIX
         return stream_name
 
-    async def _get_or_create_stream(
-        self,
-        stream_name: str,
-        queue_id: str | None,
-        codec: str | None = None,
-        is_meta: bool = False,
-    ) -> Snapstream:
-        """Create new stream on snapcast server (or return existing one)."""
-        # prefer to reuse existing stream if possible
+    async def _get_or_create_stream(self, stream_name: str, queue_id: str | None) -> Snapstream:
         if stream := self._get_snapstream(stream_name):
             return stream
-        # The control script is used only for music streams in the builtin server
-        # (queue_id is None only for announcement streams).
+
         extra_args = ""
         if (
             self.provider._use_builtin_server
             and queue_id
             and self.provider._controlscript_available
         ):
-            # Create socket server for control script communication
             socket_path = await self.provider.get_or_create_socket_server(queue_id)
             extra_args = (
                 f"&controlscript={urllib.parse.quote_plus('control.py')}"
@@ -391,46 +296,24 @@ class SnapCastPlayer(Player):
                 f"--streamserver-port={self.mass.streams.publish_port}"
             )
 
-        if codec:
-            extra_args += f"&codec={codec}"
-
-        if is_meta:
-            announcement_stream_name = self._get_stream_name(SnapCastStreamType.ANNOUNCEMENT)
-            music_stream_name = self._get_stream_name(SnapCastStreamType.MUSIC)
-            uri = f"meta:///{announcement_stream_name}/{music_stream_name}?name={stream_name}"
-        else:
-            # pick a random port
+        attempts = 50
+        while attempts:
+            attempts -= 1
             port = random.randint(4953, 4953 + 200)
-            uri = (
+            result = await self.provider._snapserver.stream_add_stream(
                 f"tcp://0.0.0.0:{port}?sampleformat=48000:16:2"
                 f"&idle_threshold={self.provider._snapcast_stream_idle_threshold}"
                 f"{extra_args}&name={stream_name}"
             )
-
-        attempts = 50
-        while attempts:
-            attempts -= 1
-            result = await self.provider._snapserver.stream_add_stream(uri)
             if "id" not in result:
-                # if the port is already taken, the result will be an error
-                self.logger.warning(result)
-                if not is_meta:
-                    # pick a new random port
-                    port = random.randint(4953, 4953 + 200)
-                    uri = (
-                        f"tcp://0.0.0.0:{port}?sampleformat=48000:16:2"
-                        f"&idle_threshold={self.provider._snapcast_stream_idle_threshold}"
-                        f"{extra_args}&name={stream_name}"
-                    )
                 continue
             return self.provider._snapserver.stream(result["id"])
-        msg = "Unable to create stream - No free port found?"
-        raise RuntimeError(msg)
+        raise RuntimeError("Unable to create stream")
 
     def _get_snapstream(self, stream_name: str) -> Snapstream | None:
-        """Get a stream by name."""
-        with suppress(KeyError):
-            return self.provider._snapserver.stream(stream_name)
+        for stream in self.provider._snapserver.streams:
+            if stream.name == stream_name:
+                return stream
         return None
 
     def _get_stream_path(self, stream: Snapstream) -> str:
@@ -438,16 +321,12 @@ class SnapCastPlayer(Player):
         return stream_path.replace("0.0.0.0", self.provider._snapcast_server_host)
 
     async def _delete_stream(self, stream_name: str) -> None:
-        if stream := self._get_snapstream(stream_name):
-            with suppress(TypeError, KeyError, AttributeError):
-                await self.provider._snapserver.stream_remove_stream(stream.identifier)
+        pass
 
     def _get_snapgroup(self) -> Snapgroup | None:
-        """Get snapcast group for given player_id."""
         return cast("Snapgroup | None", self.snap_client.group)
 
     def _set_childs_state(self) -> None:
-        """Set the state of the child`s of the player."""
         for child_player_id in self.group_members:
             if child_player_id == self.player_id:
                 continue
@@ -456,15 +335,13 @@ class SnapCastPlayer(Player):
                 mass_child_player.update_state()
 
     def _get_active_snapstream(self) -> Snapstream | None:
-        """Get active stream for given player_id."""
         if group := self._get_snapgroup():
             return self._get_snapstream(group.stream)
         return None
 
     def _group_childs(self) -> None:
-        """Return player_ids of the players synced to this player."""
         snap_group = self._get_snapgroup()
-        assert snap_group is not None  # for type checking
+        assert snap_group is not None
         self._attr_group_members.clear()
         if self.synced_to is not None:
             return
